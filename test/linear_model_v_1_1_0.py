@@ -1,7 +1,6 @@
 """
 .. sectionauthor:: Asher Bender <a.bender.dev@gmail.com>
 .. codeauthor:: Asher Bender <a.bender.dev@gmail.com>
-.. improved:: Gustavo Landfried <gustavolandfried@gmail.com>
 
 .. |bool| replace:: :class:`.bool`
 .. |callable| replace:: :func:`.callable`
@@ -16,7 +15,6 @@
 """
 
 # Copyright 2015 Asher Bender
-# Copyright 2025 Asher Bender and Gustavo Landfried
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,73 +28,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#The Bayesian linear model module was created using the following references:
-# [1] Murphy, K. P., Machine learning: A probabilistic perspective, The MIT Press, 2012
-# [2] Bishop, C. M, Pattern Recognition and Machine Learning (Information Science and Statistics), Jordan, M.; Kleinberg, J. & Scholkopf, B. (Eds.), Springer, 2006
-# [3] Murphy, K. P., Conjugate Bayesian analysis of the Gaussian distribution, Department of Computer Science, The University of British Columbia, 2007
-
 import numpy as np
 import scipy.stats
 from scipy.special import gammaln
-import warnings
-# https://docs.python.org/3/library/warnings.html#warnings.warn
-
-# --------------------------------------------------------------------------- #
-#                              Utility Functions
-# --------------------------------------------------------------------------- #
-
-def safe_logdet(A):
-    """Compute log determinant in a numerically stable way.
-    
-    Args:
-        A (ndarray): Square matrix
-        
-    Returns:
-        float: Log determinant
-    """
-    sign, logdet = np.linalg.slogdet(A)
-    
-    if sign <= 0:
-        if np.isclose(sign, 0):
-            # Handle singular matrix case
-            warnings.warn("Matrix is singular or near-singular in logdet calculation", RuntimeWarning)
-            return -np.inf
-        else:
-            # This should not happen for positive definite matrices
-            warnings.warn("Negative determinant encountered in logdet calculation", RuntimeWarning)
-    
-    return logdet
-
-
-def safe_solve(A, b, rcond=1e-10):
-    """Solve linear system Ax=b with robust handling of ill-conditioned matrices.
-    
-    Args:
-        A (ndarray): Coefficient matrix
-        b (ndarray): Right-hand side vector/matrix
-        rcond (float): Cutoff for small singular values
-        
-    Returns:
-        ndarray: Solution to Ax=b
-    """
-    # Check conditioning of the matrix
-    cond = np.linalg.cond(A)
-    
-    if cond > 1e12:
-        warnings.warn(f"Matrix is ill-conditioned (cond={cond:.2e}). Results may be inaccurate.", RuntimeWarning)
-        
-        # Use more stable pseudo-inverse for very ill-conditioned matrices
-        x = np.linalg.lstsq(A, b, rcond=rcond)[0]
-    else:
-        try:
-            # Try direct solve first
-            x = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            # Fall back to least squares
-            x = np.linalg.lstsq(A, b, rcond=rcond)[0]
-            
-    return x
-
+#from numpy.core.umath_tests import inner1d
 
 # --------------------------------------------------------------------------- #
 #                              Module Functions
@@ -122,7 +57,7 @@ def _update(X, y, mu, S, alpha, beta):
       X (|ndarray|): (N x M) model inputs.
       y (|ndarray|): (N x 1) target outputs.
       mu (|ndarray|): Mean of the normal distribution.
-      S (|ndarray|): Dispersion of the normal distribution (precision matrix).
+      S (|ndarray|): Dispersion of the normal distribution.
       alpha (|float|): Shape parameter of the inverse Gamma distribution.
       beta (|float|): Scale parameter of the inverse Gamma distribution.
 
@@ -131,6 +66,7 @@ def _update(X, y, mu, S, alpha, beta):
            alpha, beta)
 
     """
+
     # Store prior parameters.
     mu_0 = mu
     S_0 = S
@@ -138,40 +74,38 @@ def _update(X, y, mu, S, alpha, beta):
     # Update precision (Eq 7.71 ref [1], modified for precision).
     S = S_0 + np.dot(X.T, X)
 
+    # Update mean using cholesky decomposition.
+    #
+    # For:
+    #     Ax = b
+    #     L = chol(A)
+    #
+    # The solution can be given by:
+    #     x = L.T \ (L \ b)
+    #
     # Update mean (Eq 7.70 ref[1], modified for precision).
-    #
-    # Use more stable solver instead of direct Cholesky
-    #
-    # https://stackoverflow.com/questions/64831266/all-eigenvalues-are-positive-still-np-linalg-cholesky-is-giving-error-that-mat
-    #
-    # For matrices of moderate size, the performance difference is generally minimal. Cholesky is very stable for well-conditioned positive definite matrices, but fails completely if the matrix is not positive definite or close to singular.
     b = S_0.dot(mu_0) + X.T.dot(y)
-    mu = safe_solve(S, b)
+    L = np.linalg.cholesky(S)
+    mu = np.linalg.solve(L.T, np.linalg.solve(L, b))
 
     # Update shape parameter (Eq 7.72 ref [1]).
     N = X.shape[0]
     alpha += N / 2.0
 
     # Update scale parameter (Eq 7.73 ref [1]).
-    beta += 0.5 * (
-        mu_0.T.dot(S_0.dot(mu_0)) +
-        y.T.dot(y) -
-        mu.T.dot(S.dot(mu))
-    ).item()
-
-    # Ensure beta is positive (numerical stability)
-    beta = max(beta, 1e-10)
+    beta += 0.5 * (mu_0.T.dot(S_0.dot(mu_0)) +
+                         y.T.dot(y) -
+                         mu.T.dot(S.dot(mu))).item()
 
     return mu, S, alpha, beta
 
 
-def _uninformative_fit(X, y, reg=1e-16):
-    """Initialise sufficient statistics using an uninformative prior with regularization.
+def _uninformative_fit(X, y):
+    """Initialise sufficient statistics using an uninformative prior.
 
     Args:
       X (|ndarray|): (N x M) model inputs.
       y (|ndarray|): (N x 1) target outputs.
-      reg (float): Regularization parameter for numerical stability.
 
     Returns:
       |tuple|: The updated sufficient statistics are return as a tuple (mu, S,
@@ -180,33 +114,12 @@ def _uninformative_fit(X, y, reg=1e-16):
     """
 
     N, D = X.shape
+    XX = np.dot(X.T, X)
 
-    # Add regularization for numerical stability
-    XX = np.dot(X.T, X) + reg * np.eye(D)
-
-    # Use stable solver
-    mu = safe_solve(XX, np.dot(X.T, y))
-    
-    # Compute inverse with care
-    try:
-        V = np.linalg.inv(XX)
-    except np.linalg.LinAlgError:
-        # Fall back to pseudo-inverse for numerical stability
-        warnings.warn("Using pseudo-inverse instead of XX calculation due to numerical issues", RuntimeWarning)
-        # For a system Ax = b that has no exact solution, pinv provides the solution that minimises ‖Ax - b‖ with the lowest norm ‖x‖.
-        # Unlike inv(), which throws error with singular matrices, pinv() always provides a 'best approximation' to the inverse.
-        V = np.linalg.pinv(XX)
-
-    # Uninformative prior parameters
-    alpha = max(float(N - D) / 2.0, 1.0 + 1e-8) # Ensure alpha > 1 for numerical stability
-    # An Inverse-Gamma distribution with shape parameter alpha, the mean exists only if alpha > 1 and the variance exists only if algha > 2. By ensuring that alpha = 1.0, we guarantee that the posterior distribution at least has a finite mean.
-
-    # Careful calculation of residual sum of squares
-    residuals = y - np.dot(X, mu)
-    beta = 0.5 * np.sum(residuals**2)
-
-    # Ensure beta is positive
-    beta = max(beta, 1e-10)
+    mu = np.linalg.solve(XX, np.dot(X.T, y))
+    V = np.linalg.inv(XX)
+    alpha = float(N - D) / 2.0
+    beta = 0.5 * np.sum((y - np.dot(X, mu))**2)
 
     return mu, V, alpha, beta
 
@@ -222,6 +135,7 @@ def _predict_mean(X, mu):
       |ndarray|: posterior mean
 
     """
+
     # Calculate mean.
     #     Eq 7.76 ref [1]
     return np.dot(X, mu)
@@ -232,27 +146,21 @@ def _predict_variance(X, S, alpha, beta):
 
     Args:
       X (|ndarray|): (N x M) input query locations to perform prediction.
-      S (|ndarray|): Dispersion of the normal distribution (precision matrix).
+      S (|ndarray|): Dispersion of the normal distribution.
       alpha (|float|): Shape parameter of the inverse Gamma distribution.
       beta (|float|): Scale parameter of the inverse Gamma distribution.
 
     Returns:
-      |ndarray|: posterior standard deviation
+      |ndarray|: posterior variance
 
     """
+
     # Note that the scaling parameter is not equal to the variance in the
     # general case. In the limit, as the number of degrees of freedom reaches
     # infinity, the scale parameter becomes equivalent to the variance of a
     # Gaussian.
-    
-    # Use stable solver instead of direct inversion
-    XSinv = safe_solve(S, X.T).T
-    uw = np.dot(X, XSinv)
-    
-    # Ensure variance scaling is positive
-    scale_factor = max(beta / alpha, 1e-10)
-    
-    S_hat = scale_factor * (np.eye(len(X)) + uw)
+    uw = np.dot(X, np.linalg.solve(S, X.T))
+    S_hat = (beta / alpha) * (np.eye(len(X)) + uw)
     S_hat = np.sqrt(np.diag(S_hat))
 
     return S_hat
@@ -265,30 +173,26 @@ def _posterior_likelihood(y, m_hat, S_hat, alpha, log=False):
       y (|ndarray|): (N x 1) output query locations.
       m_hat (|ndarray|): Predicted mean.
       S_hat (|ndarray|): Predicted variance.
+      S (|ndarray|): Dispersion of the normal distribution.
       alpha (|float|): Shape parameter of the inverse Gamma distribution.
       log (|bool|, *optional*): Set to |True| to return the log-likelihood.
 
     Returns:
-      |ndarray|: posterior likelihood or log-likelihood
+      |ndarray|: posterior variance
 
     """
-    # Ensure degrees of freedom is at least 1 for numerical stability
-    df = max(2 * alpha, 1.0)
-    
-    # Ensure scale is positive
-    S_hat = np.maximum(S_hat, 1e-10)
 
     if log:
-        q = scipy.stats.t.logpdf(y, df=df, loc=m_hat, scale=S_hat)
+        q = scipy.stats.t.logpdf(y, df=2 * alpha, loc=m_hat, scale=S_hat)
     else:
-        q = scipy.stats.t.pdf(y, df=df, loc=m_hat, scale=S_hat)
+        q = scipy.stats.t.pdf(y, df=2 * alpha, loc=m_hat, scale=S_hat)
 
     return q
 
 
 def _model_evidence(N, S_N, alpha_N, beta_N,
-                   S_0=None, alpha_0=None, beta_0=None,
-                   log=True, fallback=False):
+                    S_0=None, alpha_0=None, beta_0=None,
+                    log=True):
     """Return log marginal likelihood of the data (model evidence).
 
     Note, if any of the optional parameters are set to |None|, their
@@ -296,19 +200,19 @@ def _model_evidence(N, S_N, alpha_N, beta_N,
 
     Args:
       N (|int|): Number of observations.
-      S_N (|ndarray|): Dispersion of the normal distribution (precision matrix).
+      S_N (|ndarray|): Dispersion of the normal distribution.
       alpha_N (|float|): Shape parameter of the inverse Gamma distribution.
       beta_N (|float|): Scale parameter of the inverse Gamma distribution.
       S_0 (|ndarray|, *optional*): Prior dispersion of the normal distribution.
       alpha_0 (|float|, *optional*): Prior shape parameter of the inverse Gamma distribution.
       beta_0 (|float|, *optional*): Prior scale parameter of the inverse Gamma distribution.
       log (|bool|, *optional*): Set to |False| to return the (non-log) likelihood.
-      fallback (|bool|, *optional*): Set to |True| to enable the fallback based on eigenvalues.
 
     Returns:
       |float|: The log marginal likelihood is returned.
 
     """
+
     # The likelihood can be broken into simpler components:
     # (Eq 3.118 ref [2], Eq 203 ref [3])
     #
@@ -335,12 +239,8 @@ def _model_evidence(N, S_N, alpha_N, beta_N,
 
     A = -0.5 * N * np.log(2 * np.pi)
 
-    # Check beta values are valid
-    beta_N = max(beta_N, 1e-10)  # Ensure positive
-
     # Prior value specified.
     if beta_0 is not None:
-        beta_0 = max(beta_0, 1e-10)  # Ensure positive
         B = alpha_0 * np.log(beta_0) - alpha_N * np.log(beta_N)
 
     # Approximate uninformative prior.
@@ -355,56 +255,21 @@ def _model_evidence(N, S_N, alpha_N, beta_N,
     else:
         C = gammaln(alpha_N)
 
-    # Compute log determinants safely
-    try:
-        # Convert precision to covariance
-        S_N_cov = np.linalg.inv(S_N) 
-        logdet_SN = safe_logdet(S_N_cov)
-        
-        # Prior value specified
-        if S_0 is not None:
-            # Convert precision to covariance
-            S_0_cov = np.linalg.inv(S_0)
-            logdet_S0 = safe_logdet(S_0_cov)
-            D = 0.5 * logdet_SN - 0.5 * logdet_S0
-        # Approximate uninformative prior
-        else:
-            D = 0.5 * logdet_SN
-    except Exception as e:
-        warnings.warn(f"Error in logdet calculation: {str(e)}. Using fallback method.", RuntimeWarning)
-        # Fallback method using eigenvalues
-        if fallback:
-            try:
-                eigvals_N = np.linalg.eigvalsh(S_N)
-                # Avoid negative eigenvalues
-                eigvals_N = np.maximum(eigvals_N, 1e-10)
-                logdet_SN = np.sum(np.log(eigvals_N))
+    # Prior value specified.
+    S_N = np.linalg.inv(S_N)
+    if S_0 is not None:
+        S_0 = np.linalg.inv(S_0)
+        D = 0.5 * np.log(np.linalg.det(S_N)) - \
+            0.5 * np.log(np.linalg.det(S_0))
 
-                if S_0 is not None:
-                    eigvals_0 = np.linalg.eigvalsh(S_0)
-                    eigvals_0 = np.maximum(eigvals_0, 1e-10)
-                    logdet_S0 = np.sum(np.log(eigvals_0))
-                    D = 0.5 * logdet_SN - 0.5 * logdet_S0
-                else:
-                    D = 0.5 * logdet_SN
-            except:
-                # Last resort fallback
-                warnings.warn("Critical failure in log determinant calculation. Returning approximate evidence.", RuntimeWarning)
-                D = 0.0
-
-    result = A + B + C + D
-    
-    # Check for invalid values
-    if not np.isfinite(result):
-        warnings.warn(f"Invalid model evidence value: {result}. Components: A={A}, B={B}, C={C}, D={D}", RuntimeWarning)
-        if fallback:
-            # Return a reasonable fallback value
-            result = -1e10 if log else 0.0
+    # Approximate uninformative prior.
+    else:
+        D = 0.5 * np.log(np.linalg.det(S_N))
 
     if log:
-        return result
+        return A + B + C + D
     else:
-        return np.exp(result)
+        return np.exp(A + B + C + D)
 
 
 def _negative_log_marginal_likelihood(params, basis, X, y):
@@ -423,27 +288,19 @@ def _negative_log_marginal_likelihood(params, basis, X, y):
       |float|: the negative log marginal likelihood.
 
     """
+
     try:
         phi = basis(X, params)
         mu, S, alpha, beta = _uninformative_fit(phi, y)
 
         m_hat = _predict_mean(phi, mu)
         S_hat = _predict_variance(phi, np.linalg.inv(S), alpha, beta)
-        
-        # Use log-likelihood for better numerical stability
-        nll = -np.sum(_posterior_likelihood(y, m_hat, S_hat, alpha, log=True))
-        
-        # Check for invalid values
-        if not np.isfinite(nll):
-            # Return a large value to guide optimization away from this point
-            return 1e10
-            
-        return nll
-    except Exception as e:
-        # Print diagnostic information
-        print(f"Error in _negative_log_marginal_likelihood() calculation with params {params}: {str(e)}")
-        # Return a large value
-        return 1e10
+        nlml = -np.sum(_posterior_likelihood(y, m_hat, S_hat, alpha))
+    except:
+        print(params)
+        raise
+
+    return nlml
 
 # --------------------------------------------------------------------------- #
 #                               Module Objects
@@ -459,13 +316,10 @@ class BayesianLinearModel(object):
 
     .. math::
 
-          \mathbf{w}_0 &= \mathbf{0}                 \\
-          \mathbf{V_0} &= (1/reg)\mathbf{I}   \\
-          a_0          &= 1.0                        \\
-          b_0          &= 1.0                        \\
-
-    Where tau is a small regularization parameter. This differs from the original
-    completely uninformative prior to provide better numerical stability.
+          \mathbf{w}_0 &= \mathbf{0}        \\
+          \mathbf{V_0} &= \infty\mathbf{I}  \\
+          a_0          &= \frac{-D}{2}      \\
+          b_0          &= 0                 \\
 
     The sufficient statistics will be initialised during the first call to
     :py:meth:`.update` where the dimensionality of the problem can be inferred
@@ -495,15 +349,14 @@ class BayesianLinearModel(object):
         inverse Gamma distribution. Set to |None| to use uninformative value.
       scale (|float|, *optional*): Prior scale parameter (:math:`b_0`) of the
         inverse Gamma distribution. Set to |None| to use uninformative value.
-      reg (|float|, *optional*): Regularization parameter to improve numerical 
-        stability. Default is 1e-6.
 
     Raises:
       ~exceptions.Exception: If any of the input parameters are invalid.
 
     """
 
-    def __init__(self, basis, D=None, location=None, dispersion=None, shape=None, scale=None, reg=1e-6):
+    def __init__(self, basis, D=None, location=None, dispersion=None,
+                 shape=None, scale=None):
 
         # Ensure the basis function expansion is a callable function.
         self.__basis = basis
@@ -515,7 +368,6 @@ class BayesianLinearModel(object):
         # Number of observations.
         self.__D = D
         self.__N = 0
-        self.__reg = reg
 
         # Store prior.
         self.__mu_0 = location
@@ -546,8 +398,8 @@ class BayesianLinearModel(object):
         # throw error).
         try:
             self.__initialise(D=self.__D)
-        except Exception as e:
-            raise Exception(f"Error during initialization: {str(e)}")
+        except:
+            raise
 
     @property
     def location(self):
@@ -555,13 +407,7 @@ class BayesianLinearModel(object):
 
     @property
     def dispersion(self):
-        """Return covariance matrix (inverse of precision matrix)"""
-        try:
-            return np.linalg.inv(self.__S_N)
-        except np.linalg.LinAlgError:
-            # Fall back to pseudo-inverse for numerical stability
-            warnings.warn("Using pseudo-inverse for covariance calculation due to numerical issues", RuntimeWarning)
-            return np.linalg.pinv(self.__S_N)
+        return np.linalg.inv(self.__S_N)
 
     @property
     def shape(self):
@@ -579,15 +425,24 @@ class BayesianLinearModel(object):
         been specified, they are checked to ensure the dimensionality has been
         specified correctly.
 
-        If values have not been specified, weakly informative values are used
-        for better numerical stability (Section 7.6.3.2 of [1]):
+        If values have not been specified, uninformative values are used
+        (Section 7.6.3.2 of [1]):]
 
             m = zero(D, 1)
-            V = (1/reg) * eye(D)  # small regularization
-            alpha = 1.0           # weakly informative
-            beta = 1.0            # weakly informative
+            V = inf * eye(D)
+            alpha = -D/2
+            beta = 0
+
+        the update equations 7.78 - 7.82 can be achieved by setting the prior
+        values in equations 7.70 - 7.73 to:
+
+            m_0 = zero(D, 1)
+            V_0 = zero(D, D)
+            alpha_0 = -D/2
+            beta_0 = 0
 
         """
+
         # Infer dimensionality...
         if D is None:
             # From the location parameter.
@@ -612,7 +467,8 @@ class BayesianLinearModel(object):
         elif self.__D is None:
             self.__D = int(D)
 
-        # If the location parameter has not been set, use zeros
+        # If the location parameter has not been set, use an uninformative
+        # value (Eq 7.78 ref [1]).
         if self.__mu_0 is None:
             self.__mu_N = np.zeros((self.__D, 1))
 
@@ -634,10 +490,10 @@ class BayesianLinearModel(object):
         else:
             self.__mu_N = self.__mu_0
 
-        # If the dispersion parameter has not been set, use a weakly informative prior
-        # with small regularization for numerical stability
+        # If the dispersion parameter has not been set, use an uninformative
+        # value (Eq 7.79 ref [1]).
         if self.__S_0 is None:
-            self.__S_N = self.__reg * np.eye(self.__D)
+            self.__S_N = np.zeros((self.__D, self.__D))
 
         # Check that the dispersion parameter is an array.
         elif not isinstance(self.__S_0, np.ndarray) or self.__S_0.ndim != 2:
@@ -658,26 +514,26 @@ class BayesianLinearModel(object):
         else:
             self.__S_N = self.__S_0
 
-        # Use weakly informative shape for better numerical stability
+        # Use uninformative shape (Eq 7.80 ref [1]).
         if self.__alpha_0 is None:
-            self.__alpha_N = 1.0
+            self.__alpha_N = -float(self.__D) / 2.0
 
         # Check the shape parameter is greater than zero.
-        elif not np.isscalar(self.__alpha_0) or self.__alpha_0 <= 0:
-            msg = 'The shape parameter must be greater than zero.'
+        elif not np.isscalar(self.__alpha_0) or self.__alpha_0 < 0:
+            msg = 'The shape parameter must be greater than or equal to zero.'
             raise Exception(msg)
 
         # User shape is valid. Set shape to specified value.
         else:
             self.__alpha_N = self.__alpha_0
 
-        # Use weakly informative scale for better numerical stability
+        # Use uninformative scale (Eq 7.81 and 7.82 ref [1]).
         if self.__beta_0 is None:
-            self.__beta_N = 1.0
+            self.__beta_N = 0
 
         # Check the scale parameter is greater than zero.
-        elif not np.isscalar(self.__beta_0) or self.__beta_0 <= 0:
-            msg = 'The scale parameter must be greater than zero.'
+        elif not np.isscalar(self.__beta_0) or self.__beta_0 < 0:
+            msg = 'The scale parameter must be greater than or equal to zero.'
             raise Exception(msg)
 
         # User scale is valid. Set scale to specified value.
@@ -703,8 +559,8 @@ class BayesianLinearModel(object):
         # Attempt to initialise the sufficient statistics from the prior.
         try:
             self.__initialise()
-        except Exception as e:
-            raise Exception(f"Error during reset: {str(e)}")
+        except:
+            raise
 
     def __design_matrix(self, X):
         """Perform basis function expansion to create design matrix."""
@@ -729,58 +585,37 @@ class BayesianLinearModel(object):
                 msg += 'Error thrown:\n %s' % str(e)
                 raise Exception(msg)
 
-    def empirical_bayes(self, x0, X, y, method='L-BFGS-B', options=None):
+    def empirical_bayes(self, x0, X, y):
         r"""Fit (non-linear) parameters to basis function using empirical Bayes.
 
         The optimal parameters are found by minimising the negative log
-        marginal likelihood. A weakly informative prior is used for a robust optimization approach.
+        marginal likelihood. An uninformative prior is used to fit the linear
+        coefficients where:
+
+        .. math::
+
+            \mathbf{w}_N &= \mathbf{V_N}\mathbf{\Phi}^T\mathbf{y}            \\
+            \mathbf{V_N} &= \left(\mathbf{\Phi}^T\mathbf{\Phi}\right)^{-1}   \\
+            a_N          &= \frac{N - D}{2}                                  \\
+            b_N          &= \frac{1}{2}
+                            \left(\mathbf{y} - \mathbf{\Phi}\mathbf{w}_N\right)^T
+                            \left(\mathbf{y} - \mathbf{\Phi}\mathbf{w}_N\right)
 
         Args:
-          x0 (|ndarray|): (N,) starting (non-linear) basis function parameters.
+          params (|ndarray|): (N,) starting (non-linear) basis function parameters.
           X (|ndarray|): (N x M) model inputs.
           y (|ndarray|): (N x 1) target outputs.
-          method (str): Optimization method to use. Default is 'L-BFGS-B'.
-          options (dict): Options to pass to the optimizer.
 
         Returns:
           |ndarray|: parameters of the basis function.
 
         """
-        # Default optimization options for better convergence
-        default_options = {'maxiter': 100, 'ftol': 1e-6}
-        if options is not None:
-            default_options.update(options)
-        
-        # Use robust optimization with bounds if using L-BFGS-B
-        try:
-            if method == 'L-BFGS-B':
-                # Try to infer reasonable bounds if possible
-                try:
-                    bounds = [(-10, 10) for _ in range(len(x0))]
-                    sol = scipy.optimize.minimize(_negative_log_marginal_likelihood,
-                                              x0, args=(self.__basis, X, y),
-                                              method=method, bounds=bounds,
-                                              options=default_options)
-                except:
-                    # Fall back to unbounded optimization
-                    sol = scipy.optimize.minimize(_negative_log_marginal_likelihood,
-                                              x0, args=(self.__basis, X, y),
-                                              method=method, options=default_options)
-            else:
-                # Use specified method
-                sol = scipy.optimize.minimize(_negative_log_marginal_likelihood,
-                                          x0, args=(self.__basis, X, y),
-                                          method=method, options=default_options)
-        except Exception as e:
-            # If optimization fails, try with more robust method
-            warnings.warn(f"Optimization failed with {method}: {str(e)}. Trying with COBYLA.", RuntimeWarning)
-            sol = scipy.optimize.minimize(_negative_log_marginal_likelihood,
-                                      x0, args=(self.__basis, X, y),
-                                      method='COBYLA', options={'maxiter': 200})
 
-        # Check for convergence
-        if not sol.success:
-            warnings.warn(f"Optimization may not have converged: {sol.message}", RuntimeWarning)
+        # Find optimal parameters by minimising negative log marginal
+        # likelihood.
+        sol = scipy.optimize.minimize(_negative_log_marginal_likelihood,
+                                      x0, args=(self.__basis, X, y),
+                                      method='COBYLA')
 
         # Store optimal parameters.
         self.__basis_params = sol.x
@@ -788,7 +623,7 @@ class BayesianLinearModel(object):
         # Recover sufficient statistics from optimal parameters.
         phi = self.__design_matrix(X)
         self.__mu_N, self.__S_N, self.__alpha_N, self.__beta_N = \
-            _uninformative_fit(phi, y, reg=self.__reg)
+            _uninformative_fit(phi, y)
 
         # The sufficient statistics have been initialised. Prevent object from
         # checking the sufficient statistics again.
@@ -823,15 +658,11 @@ class BayesianLinearModel(object):
             dimensionality of the data is wrong.
 
         """
+
         # Ensure inputs are valid objects and the same length.
         if (not isinstance(X, np.ndarray) or not isinstance(y, np.ndarray) or
             (X.ndim != 2) or (y.ndim != 2) or (len(X) != len(y))):
             msg = 'X must be a (N x M) matrix and y must be a (N x 1) vector.'
-            raise Exception(msg)
-
-        # Check for NaN or infinite values
-        if np.any(np.isnan(X)) or np.any(np.isnan(y)) or np.any(np.isinf(X)) or np.any(np.isinf(y)):
-            msg = 'Input data contains NaN or infinite values.'
             raise Exception(msg)
 
         # Perform basis function expansion.
@@ -845,6 +676,16 @@ class BayesianLinearModel(object):
         if not self.__initialised:
             self.__initialise(D)
 
+            # Ensure distribution is defined (i.e. D < N - 1). See:
+            #
+            #     Maruyama, Y. and E. George (2008). A g-prior extension
+            #     for p > n. Technical report, U. Tokyo.
+            #
+            if self.__alpha_0 is None and self.__D >= (N - 1):
+                msg = 'Update is only defined for D < N - 1. Initialise with '
+                msg += 'more than {0} observations.'
+                raise Exception(msg.format(self.__D + 1))
+
         # Check dimensions of input data.
         if self.__D != D:
             msg = 'The input data, after basis function expansion, is '
@@ -854,9 +695,9 @@ class BayesianLinearModel(object):
         # Update sufficient statistics.
         self.__mu_N, self.__S_N, self.__alpha_N, self.__beta_N = \
             _update(phi, y, self.__mu_N, self.__S_N,
-                   self.__alpha_N, self.__beta_N)
+                    self.__alpha_N, self.__beta_N)
 
-    def predict(self, X, y=None, variance=False, ci_level=0.95):
+    def predict(self, X, y=None, variance=False):
         r"""Calculate posterior predictive values.
 
         Given a new set of test inputs, :math:`\tilde{\mathbf{X}}`, predict the
@@ -884,10 +725,8 @@ class BayesianLinearModel(object):
             (:math:`\tilde{\mathbf{X}}`) to perform prediction.
           y (|ndarray|, *optional*): (K x 1) output query locations
             (:math:`\tilde{\mathbf{y}}`) to request data likelihood.
-          variance (|bool|, *optional*): set to |True| to return the confidence
-            intervals. Default is set to |False|.
-          ci_level (|float|, *optional*): Confidence interval level (e.g., 0.95 for 95% CI).
-            Default is 0.95.
+          variance (|bool|, *optional*): set to |True| to return the 95%
+            confidence intervals. Default is set to |False|.
 
         Returns:
           |ndarray| or |tuple|:
@@ -895,10 +734,10 @@ class BayesianLinearModel(object):
               (N x 1) array.
             * (|ndarray|, |ndarray|): If ``variance`` is set to |True| a tuple
               is returned containing both the predicted means (N x 1) and the
-              confidence intervals (N x 1).
+              95% confidence intervals (N x 1).
             * (|ndarray|, |ndarray|, |ndarray|): If ``y`` is set, the value of
-              ``variance`` is ignored and the predicted means and confidence
-              intervals are returned. The final returned value is
+              ``variance`` is ignored and the predicted means and 95%
+              confidence intervals are returned. The final returned value is
               either a (N x 1) array or (K x N) matrix of likelihood values. If
               ``X`` and ``y`` are the same length (N = K), the result is
               returned as an array. If ``X`` and ``y`` are NOT the same length
@@ -910,15 +749,11 @@ class BayesianLinearModel(object):
             initialised with observed data. Call :py:meth:`.update` first.
 
         """
+
         # Ensure the sufficient statistics have been initialised.
         if not self.__initialised:
             msg = 'The sufficient statistics need to be initialised before '
             msg += "calling 'predict()'. Run 'update()' first."
-            raise Exception(msg)
-
-        # Check confidence interval level is valid
-        if not (0 < ci_level < 1):
-            msg = 'Confidence interval level must be between 0 and 1.'
             raise Exception(msg)
 
         # Perform basis function expansion.
@@ -930,11 +765,14 @@ class BayesianLinearModel(object):
         # Calculate variance.
         if (y is not None) or variance:
             S_hat = _predict_variance(phi,
-                                     self.__S_N,
-                                     self.__alpha_N,
-                                     self.__beta_N)
+                                      self.__S_N,
+                                      self.__alpha_N,
+                                      self.__beta_N)
 
-            # Calculate a one sided confidence interval based on the t-distribution
+            # Calculate a one sided 97.5%, t-distribution, confidence
+            # interval. This corresponds to a 95% two-sided confidence
+            # interval.
+            #
             # For a tabulation of values see:
             #     http://en.wikipedia.org/wiki/Student%27s_t-distribution#Confidence_intervals
             #
@@ -943,14 +781,13 @@ class BayesianLinearModel(object):
             #       the number of degrees of freedom approaches infinite, the
             #       distribution approaches a Gaussian distribution.
             #
-            alpha = 1.0 - ci_level
-            ci = scipy.stats.t.ppf(1.0 - alpha/2, 2 * self.__alpha_N)
+            ci = scipy.stats.t.ppf(0.975, 2 * self.__alpha_N)
 
-            # Return mean and confidence interval.
+            # Return mean and 95% confidence interval.
             if y is None:
                 return (m_hat, ci * S_hat[:, np.newaxis])
 
-            # Return mean, confidence interval and likelihood.
+            # Return mean, 95% confidence interval and likelihood.
             else:
                 N = phi.shape[0]
                 K = y.size
@@ -958,23 +795,23 @@ class BayesianLinearModel(object):
                 # Return array.
                 if N == K:
                     q = _posterior_likelihood(y.squeeze(),
-                                            m_hat.squeeze(),
-                                            S_hat.squeeze(),
-                                            self.__alpha_N)
+                                              m_hat.squeeze(),
+                                              S_hat.squeeze(),
+                                              self.__alpha_N)
 
                 # Return matrix result.
                 else:
                     q = _posterior_likelihood(y.reshape((K, 1)),
-                                            m_hat.reshape((1, N)),
-                                            S_hat.reshape((1, N)),
-                                            self.__alpha_N)
+                                              m_hat.reshape((1, N)),
+                                              S_hat.reshape((1, N)),
+                                              self.__alpha_N)
 
                 return (m_hat, ci * S_hat[:, np.newaxis], q)
 
         else:
             return m_hat
 
-    def evidence(self, log=True, robust=True):
+    def evidence(self, log=True):
         r"""Return log marginal likelihood of the data (model evidence).
 
         The log marginal likelihood is calculated by taking the log of the
@@ -992,11 +829,33 @@ class BayesianLinearModel(object):
                                          \frac{\Gamma\left(a_N\right)}
                                               {\Gamma\left(a_0\right)}
 
+        Note that the default prior is an improper, uninformative prior. The
+        marginal likelihood equation, specified above, equation is undefined
+        for improper priors. To approximate the marginal likelihood in this
+        situation, the prior sufficient statistics :math:`\left(V_0, a_0,
+        b_0\right)` are selectively ignored if they are unset. If all prior
+        sufficient statistics are unset (default) the marginal likelihood
+        equation is approximated as:
+
+        .. math::
+
+            \renewcommand{\det} [1]{{\begin{vmatrix}#1\end{vmatrix}}}
+
+            p\left(\mathcal{D} \right) = \frac{1}{2\pi^\frac{N}{2}}
+                                         \det{V_N}^\frac{1}{2}
+                                         \frac{1}
+                                              {b_N^{a_N}}
+                                         \Gamma\left(a_N\right)
+
+        Although this equation returns an approximate marginal likelihood, it
+        can still be used for model selection. The omitted terms, which cannot
+        be evaluated, create a constant which scales the final result. During
+        model selection this constant will be identical across all models and
+        can safely be ignored.
+
         Args:
           log (|bool|, *optional*): Set to |False| to return the (non-log)
               marginal likelihood.
-          robust (|bool|, *optional*): Set to |False| to use the original
-              calculation method (less numerically stable).
 
         Returns:
           |float|: The (log) marginal likelihood is returned.
@@ -1006,85 +865,17 @@ class BayesianLinearModel(object):
             initialised with observed data. Call :py:meth:`.update` first.
 
         """
+
         # Ensure the sufficient statistics have been initialised.
         if not self.__initialised:
             msg = 'The sufficient statistics need to be initialised before '
             msg += "calling 'evidence()'. Run 'update()' first."
             raise Exception(msg)
 
-        if robust:
-            # Use more robust calculation method
-            try:
-                # Define components of the evidence calculation based on our sufficient statistics
-                N_obs = self.__N
-                
-                # Convert precision to covariance matrices
-                try:
-                    S_N_cov = np.linalg.inv(self.__S_N)
-                    if self.__S_0 is not None:
-                        S_0_cov = np.linalg.inv(self.__S_0)
-                except np.linalg.LinAlgError:
-                    # Fall back to pseudo-inverse for numerical stability
-                    warnings.warn("Using pseudo-inverse for covariance calculation due to numerical issues", RuntimeWarning)
-                    S_N_cov = np.linalg.pinv(self.__S_N)
-                    if self.__S_0 is not None:
-                        S_0_cov = np.linalg.pinv(self.__S_0)
-                
-                # Calculate components
-                A = -0.5 * N_obs * np.log(2 * np.pi)
-                
-                # Use slogdet for numerical stability
-                sign_N, logdet_N = np.linalg.slogdet(S_N_cov)
-                
-                if sign_N <= 0:
-                    warnings.warn("Covariance matrix has non-positive determinant. Evidence calculation may be inaccurate.", RuntimeWarning)
-                    # Handle the case where determinant is negative or zero
-                    logdet_N = -np.inf if sign_N == 0 else np.log(np.abs(np.linalg.det(S_N_cov)))
-                
-                # Calculate determinant component
-                if self.__S_0 is not None:
-                    sign_0, logdet_0 = np.linalg.slogdet(S_0_cov)
-                    if sign_0 <= 0:
-                        warnings.warn("Prior covariance matrix has non-positive determinant.", 
-                                     RuntimeWarning)
-                        logdet_0 = -np.inf if sign_0 == 0 else np.log(np.abs(np.linalg.det(S_0_cov)))
-                    D = 0.5 * (logdet_N - logdet_0)
-                else:
-                    D = 0.5 * logdet_N
-                
-                # Calculate shape-scale components
-                if self.__beta_0 is not None:
-                    B = self.__alpha_0 * np.log(self.__beta_0) - self.__alpha_N * np.log(self.__beta_N)
-                else:
-                    B = -self.__alpha_N * np.log(self.__beta_N)
-                
-                if self.__alpha_0 is not None:
-                    C = gammaln(self.__alpha_N) - gammaln(self.__alpha_0)
-                else:
-                    C = gammaln(self.__alpha_N)
-                
-                # Combine for final evidence
-                evidence_val = A + B + C + D
-                
-                # Check for validity
-                if not np.isfinite(evidence_val):
-                    warnings.warn(f"Invalid evidence value: {evidence_val}. Components: A={A}, B={B}, C={C}, D={D}", 
-                                 RuntimeWarning)
-                    evidence_val = -np.inf if log else 0.0
-                
-                return evidence_val if log else np.exp(evidence_val)
-                
-            except Exception as e:
-                warnings.warn(f"Error in robust evidence calculation: {str(e)}. Falling back to standard method.", 
-                             RuntimeWarning)
-                # Fall back to standard method
-                pass
-        
-        # Use standard method
         return _model_evidence(self.__N,
-                              self.__S_N, self.__alpha_N, self.__beta_N,
-                              self.__S_0, self.__alpha_0, self.__beta_0,
-                              log=log)
+                               self.__S_N, self.__alpha_N, self.__beta_N,
+                               self.__S_0, self.__alpha_0, self.__beta_0,
+                               log=log)
 
     def random(self, samples=1):
         r"""Draw a random model from the posterior distribution.
@@ -1112,6 +903,7 @@ class BayesianLinearModel(object):
             initialised with observed data. Call :py:meth:`.update` first.
 
         """
+
         # Ensure the sufficient statistics have been initialised.
         if not self.__initialised:
             msg = 'The sufficient statistics need to be initialised before '
@@ -1123,136 +915,31 @@ class BayesianLinearModel(object):
         #
         #     Eq 7.75 ref [1]
 
-        # Try to use the standard approach first
-        try:
-            # Draw random samples from the inverse gamma distribution (1x1xN).
-            r = scipy.stats.invgamma.rvs(self.__alpha_N,
-                                        scale=self.__beta_N,
-                                        size=samples).reshape((1, 1, samples))
+        # Note: Currently the 'scipy.stats.multivariate_normal' object does not
+        #       permit (MxMxN) covariance matrices. As a result multiple
+        #       observations can only be drawn from ONE multivariate
+        #       normal. The code in this method uses broadcasting to vectorise
+        #       sampling from multiple, multivariate normals.
 
-            # Create multiple multivariate scale matrices from random gamma samples
-            # (DxDxN).
-            try:
-                sigma = np.linalg.inv(self.__S_N)
-            except np.linalg.LinAlgError:
-                # Use pseudo-inverse for stability
-                warnings.warn("Using pseudo-inverse for covariance calculation due to numerical issues", RuntimeWarning)
-                sigma = np.linalg.pinv(self.__S_N)
-                
-            sigma = r * np.repeat(sigma[:, :, np.newaxis], samples, axis=2)
+        # Draw random samples from the inverse gamma distribution (1x1xN).
+        r = scipy.stats.invgamma.rvs(self.__alpha_N,
+                                     scale=self.__beta_N,
+                                     size=samples).reshape((1, 1, samples))
 
-            # Draw random samples from the standard univariate normal distribution
-            # (1xDxN).
-            rn = np.random.normal(size=(1, self.__D, samples))
+        # Create multiple multivariate scale matrices from random gamma samples
+        # (DxDxN).
+        sigma = np.linalg.inv(self.__S_N)
+        sigma = r * np.repeat(sigma[:, :, np.newaxis], samples, axis=2)
 
-            # Create N random samples (1xD) drawn from multiple, random and unique
-            # multivariate normal distributions.
-            try:
-                L = np.rollaxis(np.linalg.cholesky(sigma.T).T, 0, 2)
-                sigma = np.dot(np.rollaxis(rn, 0, 2).T, L.T)
-            except np.linalg.LinAlgError:
-                # Fall back to eigendecomposition for stability
-                warnings.warn("Using eigendecomposition for sampling due to Cholesky failure", 
-                             RuntimeWarning)
-                samples_list = []
-                for i in range(samples):
-                    # Extract the i-th covariance matrix
-                    cov_i = sigma[:, :, i]
-                    # Compute eigendecomposition
-                    eigvals, eigvecs = np.linalg.eigh(cov_i)
-                    # Ensure eigenvalues are positive
-                    eigvals = np.maximum(eigvals, 1e-10)
-                    # Transform standard normal samples
-                    z = np.random.normal(size=self.__D)
-                    x = eigvecs.dot(np.sqrt(eigvals) * z)
-                    samples_list.append(x)
-                    
-                sigma = np.vstack(samples_list)
-                return self.__mu_N.T + sigma
-            
-            # Return (NxD) samples drawn from multivariate-normal, inverse-gamma
-            # distribution.
-            return self.__mu_N.T + sigma
-            
-        except Exception as e:
-            # Fall back to simpler sampling method if the vectorized approach fails
-            warnings.warn(f"Using alternative sampling method due to error: {str(e)}", 
-                         RuntimeWarning)
-            
-            # Alternative sampling approach
-            samples_list = []
-            
-            for _ in range(samples):
-                # Sample precision from inverse gamma
-                prec = scipy.stats.invgamma.rvs(self.__alpha_N, scale=self.__beta_N)
-                
-                # Get covariance matrix
-                try:
-                    cov = np.linalg.inv(self.__S_N) * prec
-                except np.linalg.LinAlgError:
-                    warnings.warn("Using pseudo-inverse for covariance calculation due to numerical issues", RuntimeWarning)
-                    cov = np.linalg.pinv(self.__S_N) * prec
-                
-                # Add a small jitter to ensure positive definiteness
-                cov = cov + np.eye(self.__D) * 1e-8
-                
-                # Sample from multivariate normal
-                try:
-                    sample = np.random.multivariate_normal(
-                        self.__mu_N.flatten(), cov
-                    )
-                except np.linalg.LinAlgError:
-                    # Even more basic approach if that fails
-                    z = np.random.normal(size=self.__D)
-                    sample = self.__mu_N.flatten() + z * np.sqrt(np.diag(cov))
-                    
-                samples_list.append(sample)
-                
-            return np.vstack(samples_list)
+        # Draw random samples from the standard univariate normal distribution
+        # (1xDxN).
+        rn = np.random.normal(size=(1, self.__D, samples))
 
-    def get_diagnostics(self):
-        """Return diagnostic information about the model.
-        
-        Returns:
-            dict: Dictionary containing diagnostic information
-        """
-        if not self.__initialised:
-            return {'initialised': False}
-            
-        try:
-            # Calculate eigenvalues of precision matrix
-            try:
-                eigvals_S = np.linalg.eigvalsh(self.__S_N)
-                cond_S = np.max(eigvals_S) / np.min(eigvals_S) if np.min(eigvals_S) > 0 else np.inf
-            except:
-                eigvals_S = None
-                cond_S = np.inf
-                
-            # Get covariance matrix
-            try:
-                cov = np.linalg.inv(self.__S_N)
-                eigvals_cov = np.linalg.eigvalsh(cov)
-                cond_cov = np.max(eigvals_cov) / np.min(eigvals_cov) if np.min(eigvals_cov) > 0 else np.inf
-            except:
-                cov = None
-                eigvals_cov = None
-                cond_cov = np.inf
-                
-            return {
-                'initialised': True,
-                'observations': self.__N,
-                'dimensions': self.__D,
-                'shape_parameter': self.__alpha_N,
-                'scale_parameter': self.__beta_N,
-                'condition_number_precision': cond_S,
-                'condition_number_covariance': cond_cov,
-                'min_eigenvalue_precision': np.min(eigvals_S) if eigvals_S is not None else None,
-                'min_eigenvalue_covariance': np.min(eigvals_cov) if eigvals_cov is not None else None,
-            }
-        except Exception as e:
-            return {
-                'initialised': True,
-                'error': str(e),
-                'observations': self.__N,
-                'dimensions': self.__D,
-            }
+        # Create N random samples (1xD) drawn from multiple, random and unique
+        # multivariate normal distributions.
+        L = np.rollaxis(np.linalg.cholesky(sigma.T).T, 0, 2)
+        sigma = np.dot(np.rollaxis(rn, 0, 2).T, L.T)
+
+        # Return (NxD) samples drawn from multivariate-normal, inverse-gamma
+        # distribution.
+        return self.__mu_N.T + sigma
