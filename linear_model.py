@@ -246,16 +246,19 @@ def _predict_variance(X, S, alpha, beta):
     # Gaussian.
     
     # Use stable solver instead of direct inversion
-    XSinv = safe_solve(S, X.T).T
-    uw = np.dot(X, XSinv)
-    
-    # Ensure variance scaling is positive
-    scale_factor = max(beta / alpha, 1e-10)
-    
-    S_hat = scale_factor * (np.eye(len(X)) + uw)
+
+    uw = np.dot(X, np.linalg.solve(S, X.T))
+    S_hat = (beta / alpha) * (np.eye(len(X)) + uw)
     S_hat = np.sqrt(np.diag(S_hat))
 
     return S_hat
+    #XSinv = safe_solve(S, X.T).T
+    #uw = np.dot(X, XSinv)
+    # Ensure variance scaling is positive
+    #scale_factor = max(beta / alpha, 1e-10)
+    #S_hat = scale_factor * (np.eye(len(X)) + uw)
+    #S_hat = np.sqrt(np.diag(S_hat))
+    #return S_hat
 
 
 def _posterior_likelihood(y, m_hat, S_hat, alpha, log=False):
@@ -548,6 +551,12 @@ class BayesianLinearModel(object):
             self.__initialise(D=self.__D)
         except Exception as e:
             raise Exception(f"Error during initialization: {str(e)}")
+
+    @property
+    def size(self):
+        if self.__N is None:
+            warnings.warn("The model is not initialised. Returning None for shape", RuntimeWarning)
+        return self.__N
 
     @property
     def location(self):
